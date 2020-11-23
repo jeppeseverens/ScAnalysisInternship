@@ -1,0 +1,534 @@
+
+# Load libraries
+
+```{r  message=FALSE}
+library(Seurat)
+library(dplyr)
+library(data.table)
+library(Matrix)
+library(ggplot2)
+library(openxlsx)
+library(svglite)
+```
+
+# Set path standards
+
+```{r}
+setwd("~/<your working directory") #  fill this in 
+pathFigures = "figures/"
+pathTop10 = "figures/top10perclust"
+```
+
+Now we build our expression matrix from the available counts. These counts
+contain cells from both tdtomato+ cells and wild type cells This is because there
+was still space on the plates so Nefeli added wild type cells also.
+
+TdTomato x LepR-Cre mice were used to be able to FACS sort for cells expressing
+Lepr. This was done since LepR expression is too low to reliable find with ScRNASeq.
+
+Part of these cells came from fed mice ("fed cells")
+Part of these cells came from fasted mice ("fasted cells")
+
+Also ERCC spike ins were used, but I did not use these for quality controls. So I
+left in how to potentially use them but remove them.
+
+```{r}
+#Load in expression matrix and metadata
+expMatrix <- read.table("expMatrix/merged_starmap_Nef_cellsrenamed_total.coutt.tsv")
+metadata <- read.table("expMatrix/metadata_starmap_Nef_plate_1_total.coutt.tsv")
+
+# Remove ERCC spike ins
+indexERCC <- grep(pattern = "ERCC", x = rownames(expMatrix), value = FALSE)
+#percentERCC <- Matrix::colSums(expMatrix[indexERCC, ])/Matrix::colSums(expMatrix)
+expMatrix <- expMatrix[-indexERCC, ] #This removes the ERCCs from your expMatrix and metadata
+metadata <- metadata[-indexERCC, ] 
+
+# Some data cleaning
+rownames(expMatrix) <- rownames(metadata)
+colnames(expMatrix) <- sub(pattern = "_|\\.| |,", replacement = "-", x= colnames(expMatrix))
+rownames(expMatrix) <- sub(pattern = "_|\\.| |,", replacement = "-", x= rownames(expMatrix))
+colnames(expMatrix) <- make.unique(names = colnames(expMatrix), sep = "-")
+rownames(expMatrix) <- make.unique(names = rownames(expMatrix), sep = "-")
+
+# Keep only the tdTomato+ cells by grepping them and then keeping only those columns
+# (cells are on the columns, genes on the rows)
+tomcells <-grep(pattern=".*tom.*", x = colnames(expMatrix), value = FALSE)
+expMatrixTom <- expMatrix[, tomcells]
+
+# For Nefeli: maybe these come in handy?
+#empCells <-grep(pattern=".*emp.*", x = colnames(expMatrix), value = FALSE)
+#wtCells <-grep(pattern=".*WT.*", x = colnames(expMatrix), value = FALSE)
+#fedcCells <-grep(pattern=".*fed.*", x = colnames(expMatrixTom), value = FALSE)
+#fastedCells <-grep(pattern=".*fast.*", x = colnames(expMatrixTom), value = FALSE) 
+```
+
+Now we create our Seurat object. To only select high quality cells we only keep
+cells with a minimum of 2000 features (genes). We also add the percentage of 
+mitochondrial cells to the metadata of the Seurat object. Since this is also
+a measure for QC. (High mitochondrial rna percentage means cell was damaged)
+
+```{r}
+# If you want you can change the min.features here
+min.features = 2000
+# Create Seurat object and all genes with mt- in front of their gene name are
+# used to determine percentage of mitochondrial RNA per cell.
+dataObject <- CreateSeuratObject(counts = expMatrixTom, min.features = min.features, names.field = 0)
+dataObject[['percent.mito']] <- PercentageFeatureSet(dataObject, pattern = "mt-")
+dataObject
+```
+
+Now we create some plots so we can look at the amount of genes, RNA count and
+percentage of mitochondrial RNA per cell in Violin and Scatter plots
+
+```{r echo=FALSE}
+VlnPlot(dataObject, features = c("nFeature_RNA", "nCount_RNA", "percent.mito"), ncol = 3)
+```
+
+```{r}
+plot1 <- FeatureScatter(dataObject, feature1 = "nCount_RNA", feature2 = "percent.mito", group.by = "orig.ident")
+plot2 <- FeatureScatter(dataObject, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+CombinePlots(plots = list(plot1, plot2))
+```
+
+In these plots we can see there are cells with more than 30% mitochondrial RNA.
+Several cut-offs have been used in literature, but iteratively a cut off of 15%
+seems to get qualitative clustering for this dataset.
+
+```{r}
+# Remove cells with more than 15% mito RNA
+dataObject <- subset(x = dataObject, subset = percent.mito < 15)
+dataObject
+
+cat("Final dataset has", ncol(dataObject@assays[["RNA"]]), "cells")
+```
+
+Now we have our cleanud up dataset, where we filtered out low quality cells.
+We can thus run the Seurat pipeline.
+1. Data is log normalized
+2. Variable features are found, these are features where expression varies more
+than is average for all features.
+3. Data is then scaled and centered. The mitochondrial RNA is individually regressed
+since the % of mitochondrial RNA should be relatively the same in all samples
+(some people do not agree with this). The end results of regressing mito % seperately
+is that they never show up as markers for cells.
+4. PCA is performed on the variable features to be later used for clustering.
+This speeds up clustering.
+
+We also use the jackstraw method to determine amount of PCs
+
+```{r message = F}
+# Normalize
+dataObject <- NormalizeData(object = dataObject, normalization.method = "LogNormalize", scale.factor = 10000)
+# Find variable features
+dataObject <- FindVariableFeatures(object = dataObject) 
+# Scale
+dataObject <- ScaleData(object = dataObject, features = VariableFeatures(dataObject), vars.to.regress = c("percent.mito") )
+# PCA
+dataObject <- RunPCA(object = dataObject, features = VariableFeatures(dataObject), verbose = FALSE)
+
+# Jackstraw, takes like 3 minutes on my laptop
+dataObject <- JackStraw(object = dataObject, num.replicate = 200, dims = 50)
+dataObject <- ScoreJackStraw(object = dataObject, dims = 1:50)
+JackStrawPlot(dataObject, dims = 1:50)
+```
+
+Also, because these graphs are not that easy to read. I made a simple function 
+which uses the Seurat object and pScore cutoff as input to grab all significant
+PCs.
+
+```{r}
+signDims <- function(object, pScore) {
+  dims <- data.frame(object@reductions$pca@jackstraw$overall.p.values)
+  dims <- subset(dims, dims$Score < pScore)
+  dims <- dims$PC
+  return(dims)
+} 
+```
+
+Now we can do clustering. Check out the Seurat paper to see how this works.
+https://satijalab.org/seurat/
+
+```{r}
+# Find nearest neighbours, with as input our object and significant dims with a 
+# p score lower than 0.001. And create graph.
+pScore <- 0.001
+dataObject <- FindNeighbors(object = dataObject, dims = signDims(dataObject, pScore))
+
+# Cluster the graph so we can have cell clusters. Resolution determines the 
+# amount of clusters. Iteratively the number 4 gives clusters that make
+# biologically sense.
+resolution <- 4
+dataObject <- FindClusters(object = dataObject, resolution = resolution)
+
+# Umap so we can visualise the clusters, it gets stored in the Seurat Object
+# Set seed so we can replicate
+set.seed(1)
+dataObject <- RunUMAP(object = dataObject, dims = signDims(dataObject, pScore), min.dist = 0.5)
+
+# Plot the UMAP and save
+DimPlot(object = dataObject, reduction = 'umap', label = TRUE, label.size = 4)
+ggsave(file = "UMAP plot all cells tdtom.png", path = pathFigures) #  If you save 
+#  with the extension .svg instead of .png you can edit the picture in a vector 
+#  based picture editor such as InkScape or that Adobe program.
+```
+
+Now from earlier studing of this dataset I know there are "Tac 2" cells in here,
+just very little. So I add them by hand.
+
+```{r}
+p <- DimPlot(object = dataObject, reduction = 'umap', label = TRUE, label.size = 4)
+FeaturePlot(object = dataObject, features = "Tac2", reduction = "umap")
+```
+
+Now please select these cells marked in blue in the CellSelector enviroment
+
+```{r}
+# Select the cells marked in blue
+# Tac2Cells <- CellSelector(plot = p) #  do this in terminal! Does not work in R markdown
+
+# Name these cells
+Idents(object = dataObject, cells= Tac2Cells) <- "Tac2 cells"
+# Now you can see thet have been added
+DimPlot(object = dataObject, reduction = 'umap', label = TRUE, label.size = 4) + NoLegend()
+# ggsave(file = "UMAP plot fed cells with tac2.png", path = pathFigures)
+```
+
+Again, from earlier studying I have already found which clusters contiain which 
+cells. This was done based on a lot of marker gene searching.
+
+```{r}
+clusterIds <-
+  c(
+    "Tac2 neurons",
+    "Agrp neurons 1",
+    "Tanycytes 1",
+    "Agrp neurons 2",
+    "Tanycytes 2",
+    "Nrn1 neurons",
+    "Endothelial 4",
+    "Gjd2 neurons",
+    "Tanycytes 3",
+    "Vlmcs 1",
+    "Pituitary cells",
+    "Pomc neurons",
+    "Agrp neurons 3",
+    "Endothelial 1" ,
+    "Crhr2 neurons",
+    "Endothelial 3",
+    "Endothelial 2",
+    "Vlmcs 2",
+    "Ghrh neurons",
+    "Agrp neurons Fasted",
+    "Oligodendrocytes",
+    "Astrocytes"
+  ) #  res = 4, all dims with p < 0.001, f2000 and m15%
+
+clusterIds.ordered <-
+  c(
+    "Agrp neurons 1",
+    "Agrp neurons 2",
+    "Agrp neurons 3",
+    "Agrp neurons Fasted",
+    "Pomc neurons",
+    "Tac2 neurons",
+    "Nrn1 neurons",
+    "Crhr2 neurons",
+    "Gjd2 neurons",
+    "Ghrh neurons",
+    "Pituitary cells",
+    "Astrocytes",
+    "Tanycytes 1",
+    "Tanycytes 2" ,
+    "Tanycytes 3",
+    "Oligodendrocytes",
+    "Endothelial 1",
+    "Endothelial 2",
+    "Endothelial 3",
+    "Endothelial 4",
+    "Vlmcs 1",
+    "Vlmcs 2"
+  ) #  res = 4, all dims with p < 0.001, f2000 and m15%
+
+# Change the names
+names(clusterIds) <- levels(dataObject)
+dataObject <- RenameIdents(dataObject, clusterIds)
+dataObject@active.ident <- factor(dataObject@active.ident, levels = clusterIds.ordered)
+
+# Plot
+DimPlot(object = dataObject, reduction = 'umap', label = TRUE, label.size = 4, repel = TRUE) + NoLegend() + NoAxes()
+```
+
+Now we can use FindAllMarkers() to find which genes are expressed more per cluster
+and thus find marker genes for these clusters. 
+
+```{r}
+# Find marker genes
+min.pct <- 0.1 # minimum amount%  of cells that need to express the gene
+logfc.threshold <- 0.2 # minimum log Fold Change for gene to be in workbook
+markers <- FindAllMarkers(object = dataObject, only.pos = TRUE, 
+                          min.pct = min.pct, logfc.threshold = logfc.threshold)
+
+# Backup so we dont need to run it again
+markersBackup <- markers
+
+# Create excel file so we can also scroll through it manually, this just works 
+# easier.
+wb <- createWorkbook()
+# For n unique clusters we create a workbook with n sheets and paste in the 
+# differentially expressed genes with LogFC and some other data.
+for ( n in unique(markers$cluster) ) {
+  addWorksheet(wb, n)
+  writeData(
+    wb,
+    n,
+    markers[markers$cluster == n, ],
+    startCol = 1,
+    startRow = 1,
+    rowNames = TRUE,
+    colNames = TRUE
+  )
+}
+# Store
+saveWorkbook(wb, paste("markers.xlsx"), overwrite = TRUE)
+```
+
+Now besides excel sheets we can also just visuallise per cluster which are the 
+top 10 marker genes, as per the p value.
+
+```{r}
+# Select top 10 per cluster
+markersFigures <- markers %>% group_by(cluster) %>% top_n(10, wt = -p_val_adj)
+
+# Store idents for loop
+idents <- as.vector(unique(markers$cluster))
+
+# Loop through genes per cluster and save plots
+lapply(idents, function(x) {
+  genes <- markersFigures %>% filter(cluster == x)
+  genes <- as.vector(genes$gene)
+  plot<- VlnPlot(object = dataObject, features = genes, pt.size = FALSE, ncol = 4)
+  return(plot)
+  clustername <- x
+  ggsave(file = paste(clustername,"vln plot 10 lowest p values.png", sep = " "), path = pathFigures, width = 17, height = 12)
+})
+```
+
+Now we can generate some figures to illustrate marker expression per cluster/cell
+type.
+
+```{r}
+vlnCellTypes <-
+  VlnPlot(
+    object = dataObject,
+    features = c(
+      "Rbfox3", #  Neurons
+      "Rax", #  Tanycytes
+      "Col1a2", #  Endothelial 
+      "Pdgfra", #  VLMCs
+      "Olig2", #  Oligodendroctytes
+      "Agt", #  Astrocytes
+      "Slc38a5", #  Endothelial
+      "Myh11", #  Endothelial
+      "Tshb" # Pituitary
+    ),
+    pt.size = FALSE,
+    ncol = 2
+  )
+# Store
+ggsave(file = "Vln plot cell types.svg", path = pathFigures, height = 20, width = 40)
+```
+
+Now for only the neurons
+
+```{r}
+VlnPlot(
+  object = dataObject,
+  features = c("Nrn1", "Gjd2", "Tac1", "Adra1b", "Crhr2", "Ghrh", "Gal"),
+  same.y.lims = F,
+  pt.size = FALSE,
+  ncol = 2
+)
+ggsave(file = "vln plot markers neurons.svg", path = pathFigures, height = 20, width = 40)
+```
+
+We can also generate FeaturePlots, which shows where in the clusters cells
+express genes. These are just dotplots by the way.
+
+```{r}
+FeaturePlot(
+  object = dataObject,
+  cells = WhichCells(object = dataObject, idents = "Ghrh neurons"), 
+  #  Only in the  Ghrh neurons
+  features = c("Slc18a3"), #  Where is Slc18a3 located 
+  reduction = 'umap',
+  label = TRUE, #  Label cluster 
+  label.size = 4, #  Label size 
+  repel = TRUE,
+  cols = c("gray80", "darkred") # These are the colours I used
+) + NoLegend() + NoAxes() #  No legend and no axis
+
+# You can save them like this
+ggsave(file = "Acetylcholine_in_ghrh_cluster.svg", path = pathFigures)
+```
+
+We can also show only the neuronal cells in a dotplot 
+
+```{r}
+neurons <-
+  c(
+    "Tac2 neurons",
+    "Agrp neurons 1",
+    "Agrp neurons 2",
+    "Nrn1 neurons",
+    "Gjd2 neurons",
+    "Pomc neurons",
+    "Agrp neurons 3",
+    "Crhr2 neurons",
+    "Ghrh neurons",
+    "Agrp neurons Fasted"
+  )
+DimPlot(
+  object = dataObject,
+  #  Which cells finds which cells belong to the Idents and can then be used
+  #  as input for the cells parameter in the function
+  cells = WhichCells(object = dataObject, idents = neurons),
+  reduction = 'umap',
+  label = TRUE,
+  label.size = 4,
+  repel = TRUE
+) + NoLegend() + NoAxes()
+```
+
+Or the non-neuronal cells
+
+```{r}
+nonNeurons <-
+  c(
+    "Vlmcs 1",
+    "Vlmcs 2",
+    "Endothelial 1",
+    "Endothelial 2",
+    "Endothelial 3",
+    "Endothelial 4",
+    "Astrocytes",
+    "Tanycytes 1",
+    "Tanycytes 2",
+    "Tanycytes 3",
+    "Oligodendrocytes",
+    "Pituitary cells"
+  )
+DimPlot(
+  object = dataObject,
+  cells = WhichCells(object = dataObject, idents = nonNeurons),
+  reduction = 'umap',
+  label = TRUE,
+  label.size = 4,
+  repel = TRUE
+) + NoLegend() + NoAxes()
+```
+
+Also, in which cells was LepR expression even found? This shows that facs + tdtomato 
+finds more cells with LepR then you NGS finds LepR
+```{r}
+# Generate violinplot showing LepR expression
+VlnPlot(object = dataObject, features = c("Lepr"))
+
+# Dotplot
+FeaturePlot(object = dataObject, features = "Lepr", reduction = 'umap', 
+            label = TRUE, label.size = 4, repel = TRUE) + NoLegend() + NoAxes()
+```
+
+Also we can look at fasted vs fed cells
+
+```{r}
+# Which cells are there left in the object
+# Which of these were from fed cells
+fedcCells <-grep(pattern=".*fed.*", x = WhichCells(dataObject), value = TRUE)
+
+# Dotplot with fed cells in red and fasted in grey
+DimPlot(object = dataObject, reduction = 'umap', label = TRUE, repel = TRUE,  
+        label.size = 4, cells.highlight = fedcCells) + NoAxes() + NoLegend() 
+
+# We can also seperate the dotplot of the UMAP by feed status
+# Create vector with "fed", repeated as many times as fits dataset
+foodStatus <- rep(c("fed"), times = length(dataObject@assays[["RNA"]]@data@Dimnames[[2]]))
+# Which cells were from fasted condition, these were on plate 5 (P5)
+fastedCellsIndex <- grep(pattern=".*-P5_*", x = dataObject@assays[["RNA"]]@data@Dimnames[[2]], value = FALSE)
+foodStatus[fastedCellsIndex] <- "fasted" #replace the "fed" with "fasted" in the vector where needed"
+dataObject$foodStatus <- foodStatus #add foodStatus, fed or fasted, to metadata
+
+# Umap splitted by fed and fasted
+DimPlot(object = dataObject, reduction = 'umap', label = TRUE, repel = TRUE, 
+        label.size = 4, split.by = 'foodStatus') + NoAxes() + NoLegend()
+```
+
+We would like to know to what clusters the fasted AGRPS neurons would belong, or 
+where they project on. To see if one of the AGRP cell types reacts more to fasting.
+Or if the cells come from all three clusters and if there are just not enough
+fasted cells for the fasted cluster also to split in three clusters.
+
+We can do this by creating two Seurat objects, one for the Fed and one for the
+Fasted cells. Seurat finds Anchors between the two sets of cells by finding nearest
+neigbours between the reference and query set. See 
+https://doi.org/10.1016/j.cell.2019.05.031; https://doi.org/10.1101/460147
+for more info.
+
+```{r}
+# Get the fasted cells in their own matrix
+fastedCells <-grep(pattern=".*fast.*", x = colnames(expMatrixTom), value = FALSE)
+fastedCells_expMatrix <- expMatrixTom[, fastedCells]
+
+# Same for fed cells
+fedCells <- grep(pattern=".*fed.*", x = colnames(expMatrixTom), value = FALSE)
+fedCells_expMatrix <- expMatrixTom[, fedCells]
+
+
+# Create a function to run the standard Seurat pipeline we did above
+runSeurat <- function(counts, min.features, mt.pattern, percentMito, name) {
+  data <- CreateSeuratObject(counts = counts, min.features = min.features, names.field = 0)
+  data[['percent.mito']] <- PercentageFeatureSet(data, mt.pattern)
+  data <- subset(x = data, subset = percent.mito < percentMito)
+  data <- NormalizeData(object = data, normalization.method = "LogNormalize", 
+                        scale.factor = 10000)
+  data <- FindVariableFeatures(object = data)
+  data[['foodStatus']] <- name
+  return(data)
+}
+
+# Run for the counts of the fasted cells and the fed cells
+fastedData <- runSeurat(fastedCells_expMatrix, 2000, "mt-", 15, "fasted")
+fedData <- runSeurat(fedCells_expMatrix, 2000, "mt-", 15, "fed")
+
+# Now we can find anchors between the data objects
+anchors <- FindIntegrationAnchors(object.list = list(fastedData, fedData), dims = 1:30)
+# And integrate the two data objects
+fedFastedIntegrated<- IntegrateData(anchorset = anchors, dims = 1:30)
+# Set name
+DefaultAssay(fedFastedIntegrated) <- "integrated"
+
+# Now we just need to do the standard scaling, PCA and jackstraw stuff
+fedFastedIntegrated <- ScaleData(object = fedFastedIntegrated, 
+                                 features = VariableFeatures(fedFastedIntegrated), 
+                                 vars.to.regress = c("percent.mito") ) 
+fedFastedIntegrated <- RunPCA(object = fedFastedIntegrated, 
+                              features = VariableFeatures(fedFastedIntegrated), 
+                              verbose = FALSE)
+
+fedFastedIntegrated <- JackStraw(object = fedFastedIntegrated, num.replicate = 200, dims = 50)
+fedFastedIntegrated <- ScoreJackStraw(object = fedFastedIntegrated, dims = 1:50)
+
+# Find nearest neighbours and cluster
+fedFastedIntegrated <- FindNeighbors(object = fedFastedIntegrated, 
+                                     dims = signDims(fedFastedIntegrated, 0.001))
+fedFastedIntegrated <- FindClusters(object = fedFastedIntegrated, 
+                                    resolution = 4)  # resultion = 4 works here also
+
+# UMAP
+fedFastedIntegrated <- RunUMAP(object = fedFastedIntegrated, 
+                               dims = signDims(fedFastedIntegrated, 0.001), min.dist = 0.5)
+
+# Plot, split by foodstatus. We can see the fasted AGRP neurons spread out over the
+# three fed AGRP neuron clusters. 
+DimPlot(object = fedFastedIntegrated, reduction = 'umap', split.by  = "foodStatus",label = TRUE, label.size = 4)
+```
+
